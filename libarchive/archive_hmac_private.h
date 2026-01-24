@@ -40,12 +40,13 @@
  */
 int __libarchive_hmac_build_hack(void);
 
-#ifdef __APPLE__
-# include <AvailabilityMacros.h>
-# if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
-#  define ARCHIVE_HMAC_USE_Apple_CommonCrypto
-# endif
-#endif
+// Don't compile against CommonCrypto.
+// #ifdef __APPLE__
+// # include <AvailabilityMacros.h>
+// # if MAC_OS_X_VERSION_MAX_ALLOWED >= 1060
+// #  define ARCHIVE_HMAC_USE_Apple_CommonCrypto
+// # endif
+// #endif
 
 #ifdef ARCHIVE_HMAC_USE_Apple_CommonCrypto
 #include <CommonCrypto/CommonHMAC.h>
