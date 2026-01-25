@@ -40,23 +40,19 @@
 #include "archive_private.h"
 #include "archive_read_private.h"
 
-#define PBZX_MAGIC "pbzx"
+#define PBZX_MAGIC_PREFIX "pbz"
+#define PBZX_MAGIC_PREFIX_LEN 3
 #define PBZX_MAGIC_LEN 4
-#define PBZX_FLAG_MORE (1ULL << 24)
-#define PBZX_XZ_MAGIC "\xFD\x37\x7A\x58\x5A\x00"
-#define PBZX_XZ_MAGIC_LEN 6
 
 struct pbzx {
-	uint64_t	flags;
+	uint64_t	block_size;
 	uint64_t	remaining;
-	unsigned char	header[PBZX_XZ_MAGIC_LEN];
-	size_t		header_pos;
-	unsigned char	tail[2];
+	uint64_t	uncompressed_size;
+	uint64_t	compressed_size;
 	enum {
 		ST_SIGNATURE,
-		ST_CHUNK_HEADER,
-		ST_EMIT_HEADER,
-		ST_CHUNK_DATA,
+		ST_BLOCK_HEADER,
+		ST_BLOCK_DATA,
 		ST_DONE
 	}	state;
 };
@@ -100,7 +96,10 @@ pbzx_bidder_bid(struct archive_read_filter_bidder *self,
 	b = __archive_read_filter_ahead(filter, PBZX_MAGIC_LEN, &avail);
 	if (b == NULL)
 		return (0);
-	if (memcmp(b, PBZX_MAGIC, PBZX_MAGIC_LEN) != 0)
+	if (memcmp(b, PBZX_MAGIC_PREFIX, PBZX_MAGIC_PREFIX_LEN) != 0)
+		return (0);
+	if (b[PBZX_MAGIC_LEN - 1] != 'z' && b[PBZX_MAGIC_LEN - 1] != 'x' &&
+	    b[PBZX_MAGIC_LEN - 1] != '4' && b[PBZX_MAGIC_LEN - 1] != 'e')
 		return (0);
 	return (PBZX_MAGIC_LEN * 8);
 }
@@ -186,68 +185,52 @@ pbzx_filter_read(struct archive_read_filter *self, const void **buff)
 		case ST_SIGNATURE:
 			if (pbzx_read_bytes(self, magic, sizeof(magic)) != ARCHIVE_OK)
 				return (ARCHIVE_FATAL);
-			if (memcmp(magic, PBZX_MAGIC, PBZX_MAGIC_LEN) != 0) {
+			if (memcmp(magic, PBZX_MAGIC_PREFIX, PBZX_MAGIC_PREFIX_LEN) != 0 ||
+			    (magic[PBZX_MAGIC_LEN - 1] != 'z' &&
+			    magic[PBZX_MAGIC_LEN - 1] != 'x' &&
+			    magic[PBZX_MAGIC_LEN - 1] != '4' &&
+			    magic[PBZX_MAGIC_LEN - 1] != 'e')) {
 				archive_set_error(&self->archive->archive,
 				    ARCHIVE_ERRNO_FILE_FORMAT,
 				    "Invalid pbzx signature");
 				return (ARCHIVE_FATAL);
 			}
-			if (pbzx_read_u64_be(self, &pbzx->flags) != ARCHIVE_OK)
+			if (pbzx_read_u64_be(self, &pbzx->block_size) != ARCHIVE_OK)
 				return (ARCHIVE_FATAL);
-			if ((pbzx->flags & PBZX_FLAG_MORE) == 0) {
-				pbzx->state = ST_DONE;
-				return (0);
-			}
-			pbzx->state = ST_CHUNK_HEADER;
+			pbzx->state = ST_BLOCK_HEADER;
 			break;
-		case ST_CHUNK_HEADER:
-			if (pbzx_read_u64_be(self, &pbzx->flags) != ARCHIVE_OK)
-				return (ARCHIVE_FATAL);
-			if (pbzx_read_u64_be(self, &pbzx->remaining) != ARCHIVE_OK)
-				return (ARCHIVE_FATAL);
-			if (pbzx->remaining < PBZX_XZ_MAGIC_LEN) {
-				archive_set_error(&self->archive->archive,
-				    ARCHIVE_ERRNO_FILE_FORMAT,
-				    "pbzx chunk length too small");
-				return (ARCHIVE_FATAL);
-			}
-			if (pbzx_read_bytes(self, pbzx->header,
-			    PBZX_XZ_MAGIC_LEN) != ARCHIVE_OK)
-				return (ARCHIVE_FATAL);
-			if (memcmp(pbzx->header, PBZX_XZ_MAGIC,
-			    PBZX_XZ_MAGIC_LEN) != 0) {
-				archive_set_error(&self->archive->archive,
-				    ARCHIVE_ERRNO_FILE_FORMAT,
-				    "pbzx chunk header is not xz");
-				return (ARCHIVE_FATAL);
-			}
-			pbzx->remaining -= PBZX_XZ_MAGIC_LEN;
-			pbzx->header_pos = 0;
-			pbzx->tail[0] = 0;
-			pbzx->tail[1] = 0;
-			pbzx->state = ST_EMIT_HEADER;
-			break;
-		case ST_EMIT_HEADER:
-			*buff = pbzx->header + pbzx->header_pos;
-			n = PBZX_XZ_MAGIC_LEN - pbzx->header_pos;
-			pbzx->header_pos = PBZX_XZ_MAGIC_LEN;
-			pbzx->state = ST_CHUNK_DATA;
-			return ((ssize_t)n);
-		case ST_CHUNK_DATA:
-			if (pbzx->remaining == 0) {
-				if (!(pbzx->tail[0] == 'Y' &&
-				    pbzx->tail[1] == 'Z')) {
-					archive_set_error(&self->archive->archive,
-					    ARCHIVE_ERRNO_FILE_FORMAT,
-					    "pbzx chunk footer is not YZ");
+		case ST_BLOCK_HEADER:
+			b = __archive_read_filter_ahead(self->upstream, 1, &avail_in);
+			if (b == NULL) {
+				if (avail_in < 0)
 					return (ARCHIVE_FATAL);
+				if (avail_in == 0) {
+					pbzx->state = ST_DONE;
+					return (0);
 				}
-				if (pbzx->flags & PBZX_FLAG_MORE) {
-					pbzx->state = ST_CHUNK_HEADER;
-					break;
-				}
-				pbzx->state = ST_DONE;
-				return (0);
+				archive_set_error(&self->archive->archive,
+				    ARCHIVE_ERRNO_FILE_FORMAT,
+				    "Truncated pbzx stream");
+				return (ARCHIVE_FATAL);
+			}
+			if (pbzx_read_u64_be(self, &pbzx->uncompressed_size) != ARCHIVE_OK)
+				return (ARCHIVE_FATAL);
+			if (pbzx_read_u64_be(self, &pbzx->compressed_size) != ARCHIVE_OK)
+				return (ARCHIVE_FATAL);
+			if (pbzx->block_size != 0 &&
+			    pbzx->uncompressed_size > pbzx->block_size) {
+				archive_set_error(&self->archive->archive,
+				    ARCHIVE_ERRNO_FILE_FORMAT,
+				    "pbzx uncompressed size too large");
+				return (ARCHIVE_FATAL);
+			}
+			pbzx->remaining = pbzx->compressed_size;
+			pbzx->state = ST_BLOCK_DATA;
+			break;
+		case ST_BLOCK_DATA:
+			if (pbzx->remaining == 0) {
+				pbzx->state = ST_BLOCK_HEADER;
+				break;
 			}
 			b = __archive_read_filter_ahead(self->upstream, 1,
 			    &avail_in);
@@ -262,13 +245,6 @@ pbzx_filter_read(struct archive_read_filter *self, const void **buff)
 			n = (size_t)avail_in;
 			if (n > pbzx->remaining)
 				n = (size_t)pbzx->remaining;
-			if (n >= 2) {
-				pbzx->tail[0] = b[n - 2];
-				pbzx->tail[1] = b[n - 1];
-			} else if (n == 1) {
-				pbzx->tail[0] = pbzx->tail[1];
-				pbzx->tail[1] = b[0];
-			}
 			*buff = b;
 			__archive_read_filter_consume(self->upstream, n);
 			pbzx->remaining -= n;
